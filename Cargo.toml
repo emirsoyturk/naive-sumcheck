@@ -1,0 +1,9 @@
+[package]
+name = "naive-sumcheck"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lambdaworks-math = "0.7.0"
+rand = "0.8.5"
+rayon = "1.10.0"
