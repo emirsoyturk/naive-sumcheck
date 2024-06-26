@@ -1,17 +1,20 @@
 use lambdaworks_math::polynomial::dense_multilinear_poly::DenseMultilinearPolynomial;
 use naive_sumcheck::{random_binary_coefficients, Fr, F};
+use rand::{rngs::ThreadRng, RngCore};
 
 struct Prover {
     polynomial: DenseMultilinearPolynomial<F>,
     sum: Fr,
     univariate_polys: Vec<DenseMultilinearPolynomial<F>>,
-    compute_time: std::time::Duration
+    compute_time: std::time::Duration,
+    random_values: Vec<Fr>
 }
 
 impl Prover {
-    fn new(coeffs: Vec<Fr>) -> Self {
-        let polynomial = DenseMultilinearPolynomial::<F>::new(coeffs);
-        Self { polynomial, sum: Fr::zero(), univariate_polys: vec![], compute_time: std::time::Duration::new(0, 0) }
+    fn new(num_coefs: usize) -> Self {
+        let coefs = random_binary_coefficients(num_coefs);
+        let polynomial = DenseMultilinearPolynomial::<F>::new(coefs);
+        Self { polynomial, sum: Fr::zero(), univariate_polys: vec![], compute_time: std::time::Duration::new(0, 0), random_values: vec![] }
     }
 
     fn evaluate_sum(&self) -> Fr {
@@ -32,7 +35,7 @@ impl Prover {
         sum
     }
 
-    fn evaluate_sum_at_point(&self, index: usize) -> Vec<Fr> {
+    fn evaluate_sum_at_point(&self, index: usize) -> DenseMultilinearPolynomial<F> {
         let num_vars = self.polynomial.num_vars();
         let num_combinations = 1 << (num_vars - 1);
         let mut univariate_poly = vec![Fr::zero(); 2];
@@ -41,11 +44,16 @@ impl Prover {
             let mut point = vec![Fr::zero(); num_vars];
             let mut bit_idx = 0;
             for (j, _) in (0..num_vars).enumerate() {
-                if j == index {
-                    continue;
+                match j.cmp(&index) {
+                    std::cmp::Ordering::Less => {
+                        point[j] = Fr::from(self.random_values[j].value());
+                    }
+                    std::cmp::Ordering::Greater => {
+                        point[j] = Fr::from((i >> bit_idx) & 1);
+                        bit_idx += 1;
+                    }
+                    _ => {}
                 }
-                point[j] = Fr::from((i >> bit_idx) & 1);
-                bit_idx += 1;
             }
 
             point[index] = Fr::zero();
@@ -57,7 +65,7 @@ impl Prover {
             univariate_poly[1] += eval;
         }
         
-        univariate_poly
+        DenseMultilinearPolynomial::<F>::new(univariate_poly)
     }
 
     fn start_round(&mut self) {
@@ -69,29 +77,20 @@ impl Prover {
 
     fn round(&mut self, index: usize) {
         let univariate_poly = self.evaluate_sum_at_point(index);
-        self.univariate_polys.push(DenseMultilinearPolynomial::<F>::new(univariate_poly.clone()));
+        self.univariate_polys.push(univariate_poly);
     }
-
-    fn start_protocol(&mut self) {
-        self.start_round();
-        for i in 0..self.polynomial.num_vars() {
-            self.round(i);
-            println!("Prover sent univariate polynomial for round {}", i);
-        }
-        println!("Prover sent sum and all univariate polynomials to verifier");
-    }
-
 }
 
 struct Verifier {
     sum: Fr,
     univariate_polys: Vec<DenseMultilinearPolynomial<F>>,
-    compute_time: std::time::Duration
+    compute_time: std::time::Duration,
+    random_values: Vec<Fr>
 }
 
 impl Verifier {
-    fn new(sum: Fr, univariate_polys: Vec<DenseMultilinearPolynomial<F>>) -> Self {
-        Self { sum, univariate_polys, compute_time: std::time::Duration::new(0, 0) }
+    fn new() -> Self {
+        Self { sum: Fr::zero(), univariate_polys: vec![], compute_time: std::time::Duration::new(0, 0), random_values: vec![] }
     }
 
     fn start_round(&self) {
@@ -99,33 +98,48 @@ impl Verifier {
     }
 
     fn round(&self, index: usize) {
+        let expected = match index {
+            0 => self.sum,
+            _ => self.univariate_polys[index - 1].evaluate(vec![self.random_values[index - 1]]).unwrap().double(),
+        };
+
         let eval1 = self.univariate_polys[index].evaluate(vec![Fr::zero()]).unwrap();
         let eval2 = self.univariate_polys[index].evaluate(vec![Fr::one()]).unwrap();
         let sum = eval1 + eval2;
-        assert_eq!(sum, self.sum, "Sumcheck failed at round {}", index);
-    }
+        println!("{:?} + {:?} = {:?} ?== {:?}", eval1.value(), eval2.value(), sum.value(), expected.value());
+        assert_eq!(sum, expected, "Sumcheck failed at round {}", index);
+    } 
 
-    fn start_protocol(&mut self) {
-        let start_time = std::time::Instant::now();
-        self.start_round();
-        for i in 0..self.univariate_polys.len() {
-            self.round(i);
-        }
-        self.compute_time = start_time.elapsed();
-        println!("Sumcheck protocol completed successfully");
+    fn pick_random(&mut self) -> Fr {
+        let random = Fr::from(ThreadRng::default().next_u64());
+        self.random_values.push(random);
+
+        random
+    }   
+}
+
+fn start_protocol(prover: &mut Prover, verifier: &mut Verifier) {
+    prover.start_round();
+    verifier.sum = prover.sum;
+    verifier.start_round();
+
+    for i in 0..prover.polynomial.num_vars() {
+        prover.round(i);
+        verifier.univariate_polys.push(prover.univariate_polys[i].clone());
+        verifier.round(i);
+        let random = verifier.pick_random();
+        prover.random_values.push(random);
     }
 }
 
 fn main() {
     println!("Naive Sumcheck Protocol");
     let num_coeffs = 2u64.pow(11) as usize;
-    let coefs = random_binary_coefficients(num_coeffs);
 
-    let mut prover = Prover::new(coefs);
-    prover.start_protocol();
-    
-    let mut verifier = Verifier::new(prover.sum, prover.univariate_polys);
-    verifier.start_protocol();
+    let mut prover = Prover::new(num_coeffs);
+    let mut verifier = Verifier::new();
+
+    start_protocol(&mut prover, &mut verifier);
 
     println!("Prover summation compute time: {:?}", prover.compute_time);
     println!("Verifier summation verification time: {:?}", verifier.compute_time);
